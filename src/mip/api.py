@@ -137,6 +137,25 @@ def _options_from_openai(body: dict) -> dict:
     return options
 
 
+def _normalize_messages(messages: list[dict]) -> list[dict]:
+    """OpenAI lets messages[].content be a string OR a list of content parts
+    ([{"type":"text","text":"..."}, {"type":"image_url",...}, ...]). Ollama's
+    /api/chat only accepts strings, so flatten the list form to joined text.
+    Non-text parts (images, etc.) are dropped — qwen2.5-coder is text-only.
+    """
+    normalized: list[dict] = []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            parts: list[str] = []
+            for p in content:
+                if isinstance(p, dict) and p.get("type") == "text":
+                    parts.append(p.get("text", ""))
+            content = "\n".join(parts)
+        normalized.append({**m, "content": content if content is not None else ""})
+    return normalized
+
+
 @app.post("/v1/chat/completions", dependencies=[Depends(require_token)])
 async def chat_completions(req: Request):
     body = await req.json()
@@ -146,6 +165,7 @@ async def chat_completions(req: Request):
         raise HTTPException(status_code=400, detail="messages must be a non-empty array")
     stream = bool(body.get("stream", False))
     options = _options_from_openai(body)
+    messages = _normalize_messages(messages)
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     client = _client()
 
