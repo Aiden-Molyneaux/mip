@@ -264,6 +264,11 @@ async def chat_completions(req: Request):
     client = _client()
     messages = await _augment_with_rag(client, messages, settings().mip_default_collection)
 
+    # Diagnostic: what are we actually sending to Ollama? Helps distinguish
+    # "content didn't make it" from "model ignored it".
+    sizes = [(m.get("role"), len(m.get("content", "") or "")) for m in messages]
+    logger.info("ollama: sending %d messages, sizes=%s", len(messages), sizes)
+
     if stream:
         async def event_stream() -> AsyncIterator[bytes]:
             try:
