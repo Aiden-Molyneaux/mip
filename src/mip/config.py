@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     mip_embed_model: str = "nomic-embed-text"
 
     qdrant_url: str = "http://localhost:6333"
+    mip_default_collection: str = "inthink"
 
     mip_state_db: str = "./data/state.db"
     mip_log_level: str = "INFO"

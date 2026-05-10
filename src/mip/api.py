@@ -1,5 +1,11 @@
 """FastAPI app exposing an OpenAI-compatible surface backed by Ollama.
 
+Each /v1/chat/completions request is augmented with project-aware RAG: the user's
+last message is embedded, top-k chunks are retrieved from MIP_DEFAULT_COLLECTION,
+and a system message containing the project rules + retrieved context is prepended
+before forwarding to Ollama. RAG failures fall through silently (logged) so chat
+keeps working when Qdrant is down or the collection is missing.
+
 Endpoints:
   POST /v1/chat/completions   OpenAI chat-completions, streaming or non-streaming. Auth required.
   GET  /v1/models             OpenAI model list. No auth — clients use this for URL validation.
@@ -10,9 +16,11 @@ CORS is wide open (allow_origins=["*"]) because Mip is reachable only via the ho
 firewall + Tailscale ACL. Tighten if exposure widens.
 """
 import json
+import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncIterator
 
 import httpx
@@ -22,6 +30,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from mip.config import settings
 from mip.inference.ollama_client import OllamaClient
+from mip.inference.prompt import build_messages, load_system_prompt
+from mip.rag.retrieve import format_context, retrieve
+
+logger = logging.getLogger("mip.api")
+
+# Resolve the system prompt path once, relative to the repo root (../../../prompts/...).
+_SYSTEM_PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "prompts" / "system_inthink.md"
+_SYSTEM_PROMPT_CACHE: str | None = None
 
 _ollama: OllamaClient | None = None
 
@@ -133,6 +149,55 @@ def _normalize_messages(messages: list[dict]) -> list[dict]:
     return normalized
 
 
+def _system_prompt() -> str:
+    """Read the project system prompt from disk once, then cache."""
+    global _SYSTEM_PROMPT_CACHE
+    if _SYSTEM_PROMPT_CACHE is None:
+        try:
+            _SYSTEM_PROMPT_CACHE = load_system_prompt(_SYSTEM_PROMPT_PATH)
+        except FileNotFoundError:
+            logger.warning("system prompt not found at %s — RAG context only", _SYSTEM_PROMPT_PATH)
+            _SYSTEM_PROMPT_CACHE = ""
+    return _SYSTEM_PROMPT_CACHE
+
+
+def _last_user_query(messages: list[dict]) -> str:
+    """Walk back through messages to find the last non-empty user message.
+    That string is the embedding query for retrieval."""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            content = m.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+    return ""
+
+
+async def _augment_with_rag(
+    ollama: OllamaClient,
+    messages: list[dict],
+    collection: str,
+) -> list[dict]:
+    """Prepend a system message containing the InThink system prompt + retrieved
+    chunks. Failures (Qdrant down, missing collection, embed errors) are logged
+    and the original messages returned — never break the chat over RAG issues.
+    """
+    query = _last_user_query(messages)
+    if not query:
+        return messages
+    try:
+        chunks = await retrieve(ollama, collection, query, top_k=10, token_budget=4000)
+    except Exception as e:
+        logger.warning("rag retrieval failed for query %r: %s — proceeding without context", query[:80], e)
+        return messages
+    if not chunks:
+        return messages
+
+    rag_context = format_context(chunks)
+    augmented = build_messages(_system_prompt(), rag_context, [])
+    logger.info("rag: %d chunks selected for query %r", len(chunks), query[:80])
+    return [*augmented, *messages]
+
+
 @app.post("/v1/chat/completions", dependencies=[Depends(require_token)])
 async def chat_completions(req: Request):
     body = await req.json()
@@ -145,6 +210,7 @@ async def chat_completions(req: Request):
     messages = _normalize_messages(messages)
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     client = _client()
+    messages = await _augment_with_rag(client, messages, settings().mip_default_collection)
 
     if stream:
         async def event_stream() -> AsyncIterator[bytes]:
