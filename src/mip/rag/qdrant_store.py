@@ -80,10 +80,11 @@ def search(
     flt: Filter | None = None
     if filter_kind:
         flt = Filter(must=[FieldCondition(key="kind", match=MatchValue(value=filter_kind))])
-    results = client.search(
+    # query_points is the modern qdrant-client API; .search() is deprecated in 1.10+.
+    response = client.query_points(
         collection_name=collection,
-        query_vector=vector,
+        query=vector,
         limit=limit,
         query_filter=flt,
     )
-    return [{"score": r.score, "payload": r.payload or {}} for r in results]
+    return [{"score": r.score, "payload": r.payload or {}} for r in response.points]
