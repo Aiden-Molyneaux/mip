@@ -31,7 +31,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from mip.config import settings
 from mip.inference.ollama_client import OllamaClient
 from mip.inference.prompt import build_messages, load_system_prompt
-from mip.rag.retrieve import format_context, retrieve
+from mip.rag.retrieve import format_context, intent_quota, retrieve
 
 # Uvicorn only configures its own loggers; without basicConfig, our logger.info()
 # calls vanish into a handler-less root. Configure once at import.
@@ -183,9 +183,13 @@ async def _augment_with_rag(
     messages: list[dict],
     collection: str,
 ) -> list[dict]:
-    """Prepend a system message containing the InThink system prompt + retrieved
-    chunks. Failures (Qdrant down, missing collection, embed errors) are logged
-    and the original messages returned — never break the chat over RAG issues.
+    """Merge the InThink system prompt + retrieved chunks INTO the existing
+    system message (or prepend if there isn't one). Two consecutive system
+    messages caused Qwen to ignore the InThink rules entirely — a single
+    merged system message keeps everything in one place.
+
+    Failures (Qdrant down, missing collection, embed errors) are logged and
+    the original messages returned — never break the chat over RAG issues.
     """
     query = _last_user_query(messages)
     if not query:
@@ -207,13 +211,43 @@ async def _augment_with_rag(
         return messages
 
     rag_context = format_context(chunks)
-    augmented = build_messages(_system_prompt(), rag_context, [])
-    top_paths = [c.get("path", "?") for c in chunks[:5]]
-    logger.info(
-        "rag: %d chunks selected for query=%r — top paths: %s",
-        len(chunks), query[:80], top_paths,
+    base_prompt = _system_prompt()
+    rag_block = (
+        "\n\n# Retrieved project context\n\n"
+        "These snippets were pulled from the project repository because they may be relevant. "
+        "Prefer reusing existing utilities and conventions over inventing new ones. "
+        "If a snippet contradicts your prior knowledge, trust the snippet.\n\n"
+        + rag_context
     )
-    return [*augmented, *messages]
+    our_content = base_prompt + rag_block
+
+    out: list[dict] = []
+    merged = False
+    for m in messages:
+        if not merged and m.get("role") == "system":
+            existing = m.get("content", "") or ""
+            out.append({
+                "role": "system",
+                "content": our_content + "\n\n---\n\n" + existing if existing else our_content,
+            })
+            merged = True
+        else:
+            out.append(m)
+    if not merged:
+        out.insert(0, {"role": "system", "content": our_content})
+
+    quota = intent_quota(query)
+    kind_counts = {"code": 0, "doc": 0, "schema": 0}
+    for c in chunks:
+        k = c.get("kind_quota") or c.get("kind", "?")
+        if k in kind_counts:
+            kind_counts[k] += 1
+    top = [(c.get("path", "?"), c.get("kind_quota") or c.get("kind"), round(c.get("score", 0), 3)) for c in chunks[:5]]
+    logger.info(
+        "rag: %d chunks for query=%r quota=%s got=%s merged=%s top=%s",
+        len(chunks), query[:80], quota, kind_counts, merged, top,
+    )
+    return out
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(require_token)])

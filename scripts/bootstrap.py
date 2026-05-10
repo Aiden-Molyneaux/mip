@@ -68,6 +68,12 @@ async def main() -> None:
     ap.add_argument("--repo", required=True, type=Path)
     ap.add_argument("--collection", required=True)
     ap.add_argument("--batch", type=int, default=32)
+    ap.add_argument(
+        "--reset",
+        action="store_true",
+        help="Delete the collection before re-indexing. Use when the file set changed "
+        "(files removed from DEFAULT_INCLUDE_FILES) so stale chunks don't linger.",
+    )
     args = ap.parse_args()
 
     repo: Path = args.repo.resolve()
@@ -75,6 +81,11 @@ async def main() -> None:
         raise SystemExit(f"--repo {repo} is not a directory")
 
     qdrant = get_client()
+    if args.reset:
+        existing = {c.name for c in qdrant.get_collections().collections}
+        if args.collection in existing:
+            print(f"[bootstrap] --reset: dropping collection {args.collection!r}")
+            qdrant.delete_collection(args.collection)
     ensure_collection(qdrant, args.collection)
 
     ollama = OllamaClient()

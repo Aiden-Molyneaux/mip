@@ -12,12 +12,14 @@ from mip.rag.chunkers.sql import chunk_sql
 from mip.rag.chunkers.ts import chunk_typescript
 
 DEFAULT_INCLUDE_DIRS = ("server/src", "web/src", "scripts")
+# Excluded from the doc set on purpose:
+#   CHANGELOG.md       — history, not knowledge; floods retrieval with dated bullets
+#   architecture.md    — high-level prose that ranks high on generic code queries but
+#                        gives the model nothing concrete to copy
+#   LEARNINGS.md /     — removed from the InThink repo on 2026-05-10
+#   TECHDEBT.md
 DEFAULT_INCLUDE_FILES = (
     "CLAUDE.md",
-    "architecture.md",
-    "LEARNINGS.md",
-    "TECHDEBT.md",
-    "CHANGELOG.md",
     "claude-workflows.md",
     "DEPLOY.md",
     "README.md",
