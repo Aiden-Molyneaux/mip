@@ -1,8 +1,7 @@
 """Heading-aware markdown chunker.
 
-Splits on `## ` so each H2 section is a self-contained chunk. This is what makes
-LEARNINGS.md and TECHDEBT.md useful — each entry is one rule, retrieved whole.
-Files with no `## ` are returned as a single chunk.
+Splits on `## ` so each H2 section is a self-contained chunk. Files with no
+`## ` are returned as a single chunk.
 """
 from pathlib import Path
 
@@ -10,12 +9,16 @@ from mip.rag.chunkers import Chunk
 
 
 def chunk_markdown(rel_path: Path, text: str) -> list[Chunk]:
+    rel_str = str(rel_path).replace("\\", "/")
+    filename = Path(rel_str).name
+
     if "\n## " not in "\n" + text:
         return [
             Chunk(
                 text=text,
                 metadata={
-                    "path": str(rel_path).replace("\\", "/"),
+                    "path": rel_str,
+                    "filename": filename,
                     "kind": "doc",
                     "lang": "md",
                     "section": "",
@@ -38,7 +41,8 @@ def chunk_markdown(rel_path: Path, text: str) -> list[Chunk]:
                 Chunk(
                     text=body,
                     metadata={
-                        "path": str(rel_path).replace("\\", "/"),
+                        "path": rel_str,
+                        "filename": filename,
                         "kind": "doc",
                         "lang": "md",
                         "section": current_heading,

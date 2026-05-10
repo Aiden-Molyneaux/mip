@@ -28,7 +28,7 @@ from mip.config import settings
 
 EMBED_DIM = 768  # nomic-embed-text v1.5
 
-_INDEXED_FIELDS = ("path", "kind", "lang", "module")
+_INDEXED_FIELDS = ("path", "filename", "kind", "lang", "module")
 
 
 def get_client() -> QdrantClient:
@@ -81,7 +81,30 @@ def search(
     flt: Filter | None = None
     if filter_kind:
         flt = Filter(must=[FieldCondition(key="kind", match=MatchValue(value=filter_kind))])
-    # query_points is the modern qdrant-client API; .search() is deprecated in 1.10+.
+    response = client.query_points(
+        collection_name=collection,
+        query=vector,
+        limit=limit,
+        query_filter=flt,
+    )
+    return [{"score": r.score, "payload": r.payload or {}} for r in response.points]
+
+
+def search_by_filename(
+    client: QdrantClient,
+    collection: str,
+    vector: list[float],
+    filename: str,
+    limit: int = 3,
+) -> list[dict]:
+    """Search restricted to chunks whose `filename` payload equals `filename`.
+    Used when the user's query literally mentions a file name like 'routes.ts'
+    — pure embedding similarity often fails to surface the canonical files,
+    but an exact match on basename always finds them. The vector still orders
+    within the filename-matched subset so we get the most relevant chunk
+    when multiple files share the basename (every module has its own routes.ts).
+    """
+    flt = Filter(must=[FieldCondition(key="filename", match=MatchValue(value=filename))])
     response = client.query_points(
         collection_name=collection,
         query=vector,

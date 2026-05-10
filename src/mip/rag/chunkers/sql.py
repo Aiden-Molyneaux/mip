@@ -24,6 +24,7 @@ def chunk_sql(rel_path: Path, text: str) -> list[Chunk]:
         migration_num = int(m.group(1))
 
     rel_str = str(rel_path).replace("\\", "/")
+    filename = Path(rel_str).name
     chunks: list[Chunk] = []
     for match in _STATEMENT_RE.finditer(text):
         stmt = match.group(0).strip()
@@ -35,6 +36,7 @@ def chunk_sql(rel_path: Path, text: str) -> list[Chunk]:
                 text=stmt,
                 metadata={
                     "path": rel_str,
+                    "filename": filename,
                     "kind": "schema",
                     "lang": "sql",
                     "migration": migration_num,
@@ -51,6 +53,7 @@ def chunk_sql(rel_path: Path, text: str) -> list[Chunk]:
                 text=text,
                 metadata={
                     "path": rel_str,
+                    "filename": filename,
                     "kind": "schema",
                     "lang": "sql",
                     "migration": migration_num,

@@ -10,6 +10,7 @@ Endpoints:
   POST /v1/chat/completions   OpenAI chat-completions, streaming or non-streaming. Auth required.
   GET  /v1/models             OpenAI model list. No auth — clients use this for URL validation.
   GET  /admin/status          Liveness + config snapshot.
+  GET  /admin/preview_rag?q=…  Run retrieval for `q` and return the assembled context as plain text. Auth required.
   GET  /health                Process-level liveness.
 
 CORS is wide open (allow_origins=["*"]) because Mip is reachable only via the host's
@@ -26,7 +27,7 @@ from typing import AsyncIterator
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from mip.config import settings
 from mip.inference.ollama_client import OllamaClient
@@ -319,6 +320,42 @@ async def status() -> JSONResponse:
             "embed_model": s.mip_embed_model,
         }
     )
+
+
+@app.get("/admin/preview_rag", dependencies=[Depends(require_token)])
+async def preview_rag(q: str) -> PlainTextResponse:
+    """Diagnostic: run retrieval for `q` and return the assembled system
+    message as plain text. Lets us inspect exactly what the model receives
+    without sending a real chat. Bearer-protected.
+    """
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="q must be non-empty")
+    chunks = await retrieve(_client(), settings().mip_default_collection, q.strip())
+    if not chunks:
+        return PlainTextResponse(f"(no chunks retrieved for query={q!r})")
+    quota = intent_quota(q)
+    header_lines = [
+        f"# Query: {q!r}",
+        f"# Intent quota: {quota}",
+        f"# Chunks retrieved: {len(chunks)}",
+        "# ──────────────────────────────────────────",
+        "",
+    ]
+    for i, c in enumerate(chunks, 1):
+        header_lines.append(
+            f"## [{i}] {c.get('path', '?')} "
+            f"(score={round(c.get('score', 0), 3)}, "
+            f"source={c.get('kind_quota', '?')}, "
+            f"kind={c.get('kind', '?')}, "
+            f"lines={c.get('line_start', '?')}-{c.get('line_end', '?')}"
+            f"{', symbol=' + c['symbol'] if c.get('symbol') else ''})"
+        )
+        header_lines.append("")
+        header_lines.append(c.get("text", ""))
+        header_lines.append("")
+        header_lines.append("# ──────────────────────────────────────────")
+        header_lines.append("")
+    return PlainTextResponse("\n".join(header_lines))
 
 
 @app.get("/health")

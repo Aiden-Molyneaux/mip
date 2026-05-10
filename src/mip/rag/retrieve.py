@@ -21,7 +21,7 @@ import re
 
 from mip.inference.ollama_client import OllamaClient
 from mip.rag.embed import embed_texts
-from mip.rag.qdrant_store import get_client, search
+from mip.rag.qdrant_store import get_client, search, search_by_filename
 
 # Rough chars→tokens for English code+docs.
 _CHARS_PER_TOKEN = 3.5
@@ -44,6 +44,10 @@ _CONVENTION_INTENT_RE = re.compile(
 _FILE_OR_SYMBOL_RE = re.compile(
     r"\b\w+\.(ts|tsx|sql|md)\b|`[A-Za-z_]\w+`|\b[a-z]+[A-Z]\w+\b"
 )
+# Bare filenames mentioned in the query (without path). Drives targeted
+# filename-based retrieval to surface canonical files like 'notes/routes.ts'
+# when the user asks about 'routes.ts'.
+_FILENAME_IN_QUERY_RE = re.compile(r"\b(\w+\.(?:ts|tsx|sql|md))\b")
 
 
 def intent_quota(query: str) -> dict[str, int]:
@@ -62,6 +66,14 @@ def _kind_priority(quota: dict[str, int]) -> list[str]:
     return sorted(quota.keys(), key=lambda k: -quota[k])
 
 
+def _ident(payload: dict) -> str:
+    return (
+        f"{payload.get('path', '?')}:"
+        f"{payload.get('line_start', 0)}-{payload.get('line_end', 0)}:"
+        f"{payload.get('chunk_index', 0)}"
+    )
+
+
 async def retrieve(
     ollama: OllamaClient,
     collection: str,
@@ -70,25 +82,55 @@ async def retrieve(
     token_budget: int = 6000,
 ) -> list[dict]:
     quota = intent_quota(query)
+    filename_mentions = list({m for m in _FILENAME_IN_QUERY_RE.findall(query)})
 
     vectors = await embed_texts(ollama, [query])
     if not vectors:
         return []
+    vec = vectors[0]
     qdrant = get_client()
 
     char_budget = int(token_budget * _CHARS_PER_TOKEN)
     used_chars = 0
     final: list[dict] = []
-    seen_ids: set[str] = set()
+    seen: set[str] = set()
 
+    def admit(payload: dict, score: float, source: str) -> bool:
+        nonlocal used_chars
+        path = payload.get("path", "?")
+        text = payload.get("text", "")
+        if not text:
+            return False
+        ident = _ident(payload)
+        if ident in seen:
+            return False
+        if used_chars + len(text) > char_budget:
+            return False
+        final.append({"score": score, "kind_quota": source, **payload})
+        seen.add(ident)
+        used_chars += len(text)
+        return True
+
+    # 1. Filename-targeted retrieval first — when the user names files, those
+    #    canonical chunks should be the spine of the context regardless of
+    #    embedding score. Each named filename gets up to 3 chunks.
+    for fname in filename_mentions:
+        for h in search_by_filename(qdrant, collection, vec, fname, limit=3):
+            admit(h["payload"], h["score"], source=f"filename:{fname}")
+
+    # 2. Per-kind quota retrieval fills in the rest. Per-file cap of 2 within
+    #    each kind so a single file can't monopolize.
     for kind in _kind_priority(quota):
         n = quota[kind]
         if n <= 0:
             continue
-        # Over-fetch so per-file cap + token cap have headroom to skip.
-        hits = search(qdrant, collection, vectors[0], limit=n * 4, filter_kind=kind)
+        hits = search(qdrant, collection, vec, limit=n * 4, filter_kind=kind)
         per_file: dict[str, int] = {}
-        taken = 0
+        # Count chunks already admitted toward this file's cap.
+        for f in final:
+            if f.get("kind") == kind:
+                per_file[f.get("path", "?")] = per_file.get(f.get("path", "?"), 0) + 1
+        taken = sum(1 for f in final if f.get("kind") == kind)
         for h in hits:
             if taken >= n:
                 break
@@ -96,20 +138,9 @@ async def retrieve(
             path = payload.get("path", "?")
             if per_file.get(path, 0) >= MAX_PER_FILE:
                 continue
-            text = payload.get("text", "")
-            if not text:
-                continue
-            # Dedupe across kinds in case a chunk matches multiple filters.
-            ident = f"{path}:{payload.get('line_start', 0)}-{payload.get('line_end', 0)}:{payload.get('chunk_index', 0)}"
-            if ident in seen_ids:
-                continue
-            if used_chars + len(text) > char_budget:
-                continue
-            final.append({"score": h["score"], "kind_quota": kind, **payload})
-            seen_ids.add(ident)
-            per_file[path] = per_file.get(path, 0) + 1
-            used_chars += len(text)
-            taken += 1
+            if admit(payload, h["score"], source=kind):
+                per_file[path] = per_file.get(path, 0) + 1
+                taken += 1
     return final
 
 
