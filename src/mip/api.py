@@ -3,8 +3,12 @@
 Endpoints:
   POST /v1/chat/completions   OpenAI chat-completions, streaming or non-streaming. Auth required.
   GET  /v1/models             OpenAI model list. No auth — clients use this for URL validation.
+  GET  /v1/global/health      OpenCode-shaped client health probe. No auth.
   GET  /admin/status          Liveness + config snapshot.
   GET  /health                Process-level liveness.
+
+CORS is wide open (allow_origins=["*"]) because Mip is reachable only via the host's
+firewall + Tailscale ACL. Tighten if exposure widens.
 
 Auth accepts either:
   Authorization: Bearer <MIP_BEARER_TOKEN>
@@ -21,6 +25,7 @@ from typing import AsyncIterator
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from mip.config import settings
@@ -39,6 +44,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Mip", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _client() -> OllamaClient:
@@ -189,3 +202,10 @@ async def status() -> JSONResponse:
 @app.get("/health")
 async def health() -> JSONResponse:
     return JSONResponse({"ok": True})
+
+
+# OpenCode (and likely other clients) probes /v1/global/health for URL validation.
+# Keep it unauthenticated — it advertises nothing that requires protection.
+@app.get("/v1/global/health")
+async def global_health() -> JSONResponse:
+    return JSONResponse({"status": "ok"})
