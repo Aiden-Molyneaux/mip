@@ -5,10 +5,11 @@ One collection per project. Payload schema (set by `bootstrap.py`):
   path          str   repo-relative POSIX path
   kind          str   "code" | "doc" | "schema"
   lang          str   "ts" | "tsx" | "md" | "sql"
-  module        str   server module name or "components"/"pages"/"lib" (optional)
-  section       str   markdown H2 heading (optional)
-  symbol        str   top-level symbol name when tree-sitter chunker lands (optional)
-  migration     int   migration number for SQL (optional)
+  module        str         server module name or "components"/"pages"/"lib" (optional)
+  section       str         markdown H2 heading (optional)
+  symbols       list[str]   top-level export names extracted from TS/TSX files (optional)
+  migration     int         migration number for SQL (optional)
+  chunk_index   int         sub-chunk index when a chunk was split by oversized-splitter (optional)
   line_start    int
   line_end      int
 """
