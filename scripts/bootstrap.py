@@ -39,15 +39,32 @@ async def main() -> None:
         files = list(iter_files(repo))
         print(f"[bootstrap] {len(files)} files to chunk")
 
-        all_chunks = []
+        raw_chunks = []
         for f in files:
             for c in chunk_file(repo, f):
-                all_chunks.append(c)
-        print(f"[bootstrap] {len(all_chunks)} chunks total")
+                raw_chunks.append(c)
+
+        all_chunks = [c for c in raw_chunks if c.text.strip()]
+        skipped = len(raw_chunks) - len(all_chunks)
+        print(
+            f"[bootstrap] {len(all_chunks)} chunks total"
+            + (f" ({skipped} empty/whitespace skipped)" if skipped else "")
+        )
 
         for batch_start in range(0, len(all_chunks), args.batch):
             batch = all_chunks[batch_start : batch_start + args.batch]
-            vectors = await embed_texts(ollama, [c.text for c in batch])
+            try:
+                vectors = await embed_texts(ollama, [c.text for c in batch])
+            except Exception as e:
+                # Surface which chunks were in the failing batch so we can identify the bad input.
+                paths_in_batch = sorted({c.metadata.get("path", "?") for c in batch})
+                lengths = [len(c.text) for c in batch]
+                print(
+                    f"[bootstrap] FAILED on batch {batch_start}-{batch_start + len(batch) - 1}: {e}\n"
+                    f"  files in batch: {paths_in_batch}\n"
+                    f"  chunk lengths: min={min(lengths)} max={max(lengths)} avg={sum(lengths) // len(lengths)}"
+                )
+                raise
             points = []
             for c, vec in zip(batch, vectors):
                 payload = {**c.metadata, "text": c.text}

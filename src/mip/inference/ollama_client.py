@@ -49,7 +49,12 @@ class OllamaClient:
 
     async def embed(self, model: str, input_texts: list[str]) -> list[list[float]]:
         r = await self._client.post("/api/embed", json={"model": model, "input": input_texts})
-        r.raise_for_status()
+        if r.status_code >= 400:
+            # Include Ollama's actual error body so callers can see which input was rejected
+            # instead of just "400 Bad Request".
+            raise RuntimeError(
+                f"ollama /api/embed {r.status_code}: {r.text[:600]}"
+            )
         return r.json()["embeddings"]
 
     async def list_models(self) -> list[dict]:
