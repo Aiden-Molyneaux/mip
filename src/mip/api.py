@@ -132,6 +132,8 @@ def _options_from_openai(body: dict) -> dict:
         options["top_p"] = body["top_p"]
     if "max_tokens" in body:
         options["num_predict"] = body["max_tokens"]
+    if "stop" in body and body["stop"] is not None:
+        options["stop"] = body["stop"]
     return options
 
 

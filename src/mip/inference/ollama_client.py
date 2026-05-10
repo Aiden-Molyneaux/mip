@@ -37,7 +37,11 @@ class OllamaClient:
         if options:
             payload["options"] = options
         async with self._client.stream("POST", "/api/chat", json=payload) as r:
-            r.raise_for_status()
+            if r.status_code >= 400:
+                # Streaming responses don't load the body until requested. Pull it now
+                # so callers can read e.response.text in their HTTPStatusError handler.
+                await r.aread()
+                r.raise_for_status()
             async for line in r.aiter_lines():
                 if not line:
                     continue
