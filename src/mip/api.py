@@ -33,6 +33,12 @@ from mip.inference.ollama_client import OllamaClient
 from mip.inference.prompt import build_messages, load_system_prompt
 from mip.rag.retrieve import format_context, retrieve
 
+# Uvicorn only configures its own loggers; without basicConfig, our logger.info()
+# calls vanish into a handler-less root. Configure once at import.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 logger = logging.getLogger("mip.api")
 
 # Resolve the system prompt path once, relative to the repo root (../../../prompts/...).
@@ -183,18 +189,30 @@ async def _augment_with_rag(
     """
     query = _last_user_query(messages)
     if not query:
+        logger.info("rag: skip — no non-empty user message in request")
         return messages
     try:
         chunks = await retrieve(ollama, collection, query, top_k=10, token_budget=4000)
     except Exception as e:
-        logger.warning("rag retrieval failed for query %r: %s — proceeding without context", query[:80], e)
+        logger.warning(
+            "rag: retrieval failed for query=%r collection=%r: %s — proceeding without context",
+            query[:80], collection, e,
+        )
         return messages
     if not chunks:
+        logger.info(
+            "rag: 0 chunks returned for query=%r collection=%r — proceeding without context",
+            query[:80], collection,
+        )
         return messages
 
     rag_context = format_context(chunks)
     augmented = build_messages(_system_prompt(), rag_context, [])
-    logger.info("rag: %d chunks selected for query %r", len(chunks), query[:80])
+    top_paths = [c.get("path", "?") for c in chunks[:5]]
+    logger.info(
+        "rag: %d chunks selected for query=%r — top paths: %s",
+        len(chunks), query[:80], top_paths,
+    )
     return [*augmented, *messages]
 
 
