@@ -1,11 +1,18 @@
 """FastAPI app exposing an OpenAI-compatible surface backed by Ollama.
 
 Endpoints:
-  POST /v1/chat/completions   OpenAI chat-completions, streaming or non-streaming.
-  GET  /v1/models             OpenAI model list.
+  POST /v1/chat/completions   OpenAI chat-completions, streaming or non-streaming. Auth required.
+  GET  /v1/models             OpenAI model list. No auth — clients use this for URL validation.
   GET  /admin/status          Liveness + config snapshot.
   GET  /health                Process-level liveness.
+
+Auth accepts either:
+  Authorization: Bearer <MIP_BEARER_TOKEN>
+  Authorization: Basic base64("<anything>:<MIP_BEARER_TOKEN>")
+The Basic form lets clients (e.g. OpenCode) that expose Username/Password fields
+authenticate by putting the token in the password field.
 """
+import base64
 import json
 import time
 import uuid
@@ -41,9 +48,23 @@ def _client() -> OllamaClient:
 
 
 def require_token(authorization: str | None = Header(default=None)) -> None:
-    expected = f"Bearer {settings().mip_bearer_token}"
-    if authorization != expected:
-        raise HTTPException(status_code=401, detail="invalid bearer token")
+    if authorization is None:
+        raise HTTPException(status_code=401, detail="missing Authorization header")
+    token = settings().mip_bearer_token
+
+    if authorization == f"Bearer {token}":
+        return
+
+    if authorization.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(authorization[len("Basic "):]).decode("utf-8")
+        except (ValueError, UnicodeDecodeError) as e:
+            raise HTTPException(status_code=401, detail=f"invalid Basic credentials: {e}") from e
+        _user, sep, password = decoded.partition(":")
+        if sep and password == token:
+            return
+
+    raise HTTPException(status_code=401, detail="invalid credentials")
 
 
 def _ollama_chunk_to_openai(chunk: dict, model: str, completion_id: str) -> dict:
@@ -136,7 +157,7 @@ async def chat_completions(req: Request):
     return JSONResponse(_ollama_full_to_openai(resp, model, completion_id))
 
 
-@app.get("/v1/models", dependencies=[Depends(require_token)])
+@app.get("/v1/models")
 async def list_models() -> JSONResponse:
     s = settings()
     advertised = [s.mip_primary_model, s.mip_fallback_model]
