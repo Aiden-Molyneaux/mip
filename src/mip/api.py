@@ -3,20 +3,12 @@
 Endpoints:
   POST /v1/chat/completions   OpenAI chat-completions, streaming or non-streaming. Auth required.
   GET  /v1/models             OpenAI model list. No auth — clients use this for URL validation.
-  GET  /v1/global/health      OpenCode-shaped client health probe. No auth.
   GET  /admin/status          Liveness + config snapshot.
   GET  /health                Process-level liveness.
 
 CORS is wide open (allow_origins=["*"]) because Mip is reachable only via the host's
 firewall + Tailscale ACL. Tighten if exposure widens.
-
-Auth accepts either:
-  Authorization: Bearer <MIP_BEARER_TOKEN>
-  Authorization: Basic base64("<anything>:<MIP_BEARER_TOKEN>")
-The Basic form lets clients (e.g. OpenCode) that expose Username/Password fields
-authenticate by putting the token in the password field.
 """
-import base64
 import json
 import time
 import uuid
@@ -61,23 +53,8 @@ def _client() -> OllamaClient:
 
 
 def require_token(authorization: str | None = Header(default=None)) -> None:
-    if authorization is None:
-        raise HTTPException(status_code=401, detail="missing Authorization header")
-    token = settings().mip_bearer_token
-
-    if authorization == f"Bearer {token}":
-        return
-
-    if authorization.startswith("Basic "):
-        try:
-            decoded = base64.b64decode(authorization[len("Basic "):]).decode("utf-8")
-        except (ValueError, UnicodeDecodeError) as e:
-            raise HTTPException(status_code=401, detail=f"invalid Basic credentials: {e}") from e
-        _user, sep, password = decoded.partition(":")
-        if sep and password == token:
-            return
-
-    raise HTTPException(status_code=401, detail="invalid credentials")
+    if authorization != f"Bearer {settings().mip_bearer_token}":
+        raise HTTPException(status_code=401, detail="invalid bearer token")
 
 
 def _ollama_chunk_to_openai(chunk: dict, model: str, completion_id: str) -> dict:
@@ -224,10 +201,3 @@ async def status() -> JSONResponse:
 @app.get("/health")
 async def health() -> JSONResponse:
     return JSONResponse({"ok": True})
-
-
-# OpenCode (and likely other clients) probes /v1/global/health for URL validation.
-# Keep it unauthenticated — it advertises nothing that requires protection.
-@app.get("/v1/global/health")
-async def global_health() -> JSONResponse:
-    return JSONResponse({"status": "ok"})
