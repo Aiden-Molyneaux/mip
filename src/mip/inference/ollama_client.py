@@ -9,9 +9,14 @@ from mip.config import settings
 
 class OllamaClient:
     def __init__(self) -> None:
+        # Generous timeouts: with ~14k-token system prompts (full RAG context),
+        # Ollama prefill on a 2080 Ti runs 20-30s before the first token. The
+        # tight 5s pool timeout caused failures when a second request arrived
+        # while the first was still in prefill. Connect+pool now 60s; read 600s
+        # covers worst-case generation.
         self._client = httpx.AsyncClient(
             base_url=settings().ollama_base_url,
-            timeout=httpx.Timeout(connect=5.0, read=300.0, write=30.0, pool=5.0),
+            timeout=httpx.Timeout(connect=60.0, read=600.0, write=60.0, pool=60.0),
         )
 
     async def chat(
