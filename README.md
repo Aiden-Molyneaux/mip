@@ -1,8 +1,15 @@
 # Mip
 
-Local coding assistant. OpenAI-compatible API over Ollama, with project-aware RAG against your own repos.
+Coding assistant that wraps any OpenAI-compatible chat endpoint (Groq, OpenRouter, Gemini, OpenAI, or local Ollama) with project-aware RAG against your own repos.
 
 Architecture and phased plan: `~/.claude/plans/intake-that-prompt-ask-purrfect-jellyfish.md`.
+
+## Backend
+
+Two modes, set via `MIP_CHAT_BACKEND`:
+
+- `openai_compat` (default) — forward to a hosted provider over OpenAI's chat-completions API. Embeddings still happen locally via Ollama (`nomic-embed-text`).
+- `ollama` — local Ollama for both chat and embeddings. Use this when offline or when you don't want code chunks leaving the host.
 
 ## Quick start (Phase 1: API only, no RAG)
 

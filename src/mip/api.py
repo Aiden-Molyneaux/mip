@@ -31,8 +31,11 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from mip.config import settings
 from mip.inference.ollama_client import OllamaClient
+from mip.inference.openai_compat_client import OpenAICompatClient
 from mip.inference.prompt import build_messages, load_system_prompt
 from mip.rag.retrieve import format_context, intent_quota, retrieve
+
+ChatClient = OllamaClient | OpenAICompatClient
 
 # Uvicorn only configures its own loggers; without basicConfig, our logger.info()
 # calls vanish into a handler-less root. Configure once at import.
@@ -46,14 +49,37 @@ logger = logging.getLogger("mip.api")
 _SYSTEM_PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "prompts" / "system_inthink.md"
 _SYSTEM_PROMPT_CACHE: str | None = None
 
+# `_ollama` is always available for embeddings (nomic-embed-text via local Ollama).
+# `_chat_client` is either the same OllamaClient (when backend == "ollama") or a
+# fresh OpenAICompatClient (when backend == "openai_compat"). Embeddings never
+# leave the host; chat goes to whichever backend is configured.
 _ollama: OllamaClient | None = None
+_chat_client: ChatClient | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _ollama
+    global _ollama, _chat_client
     _ollama = OllamaClient()
+    s = settings()
+    if s.mip_chat_backend == "openai_compat":
+        if not s.mip_chat_api_key:
+            logger.warning(
+                "mip_chat_backend=openai_compat but MIP_CHAT_API_KEY is empty — "
+                "requests will fail with 401 from %s",
+                s.mip_chat_base_url,
+            )
+        _chat_client = OpenAICompatClient(
+            base_url=s.mip_chat_base_url,
+            api_key=s.mip_chat_api_key,
+        )
+        logger.info("chat backend: openai_compat at %s", s.mip_chat_base_url)
+    else:
+        _chat_client = _ollama
+        logger.info("chat backend: ollama at %s", s.ollama_base_url)
     yield
+    if _chat_client is not None and _chat_client is not _ollama:
+        await _chat_client.aclose()
     if _ollama is not None:
         await _ollama.aclose()
 
@@ -69,10 +95,19 @@ app.add_middleware(
 )
 
 
-def _client() -> OllamaClient:
+def _embed_client() -> OllamaClient:
+    """Always Ollama. nomic-embed-text via local Ollama is the embedding path
+    regardless of chat backend."""
     if _ollama is None:
         raise RuntimeError("Ollama client not initialized — startup did not complete")
     return _ollama
+
+
+def _chat() -> ChatClient:
+    """Whichever backend was selected at startup."""
+    if _chat_client is None:
+        raise RuntimeError("Chat client not initialized — startup did not complete")
+    return _chat_client
 
 
 def require_token(authorization: str | None = Header(default=None)) -> None:
@@ -259,21 +294,56 @@ async def chat_completions(req: Request):
     if not messages:
         raise HTTPException(status_code=400, detail="messages must be a non-empty array")
     stream = bool(body.get("stream", False))
-    options = _options_from_openai(body)
     messages = _normalize_messages(messages)
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-    client = _client()
-    messages = await _augment_with_rag(client, messages, settings().mip_default_collection)
 
-    # Diagnostic: what are we actually sending to Ollama? Helps distinguish
-    # "content didn't make it" from "model ignored it".
+    # Embeddings always go through Ollama; RAG retrieval reuses that client.
+    messages = await _augment_with_rag(_embed_client(), messages, settings().mip_default_collection)
+
     sizes = [(m.get("role"), len(m.get("content", "") or "")) for m in messages]
-    logger.info("ollama: sending %d messages, sizes=%s", len(messages), sizes)
+    logger.info("upstream: sending %d messages, sizes=%s", len(messages), sizes)
+
+    chat = _chat()
+
+    if isinstance(chat, OpenAICompatClient):
+        # OpenAI-compatible passthrough — the request body shape is what the
+        # upstream wants. No format translation in either direction.
+        passthrough = ("temperature", "top_p", "max_tokens", "stop",
+                       "presence_penalty", "frequency_penalty", "seed", "tools",
+                       "tool_choice", "response_format")
+        body_to_send: dict = {
+            "model": model,
+            "messages": messages,
+            **{k: body[k] for k in passthrough if k in body},
+        }
+
+        if stream:
+            async def openai_event_stream() -> AsyncIterator[bytes]:
+                try:
+                    async for chunk in chat.chat_stream(body_to_send):
+                        yield f"data: {json.dumps(chunk)}\n\n".encode()
+                except Exception as e:
+                    logger.error("upstream chat error: %s", e)
+                    err = {"error": {"message": str(e), "type": "upstream_error"}}
+                    yield f"data: {json.dumps(err)}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+
+            return StreamingResponse(openai_event_stream(), media_type="text/event-stream")
+
+        try:
+            resp = await chat.chat(body_to_send)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
+        return JSONResponse(resp)
+
+    # Ollama backend — translate OpenAI ↔ Ollama format around a local Ollama
+    # /api/chat call. Kept for offline / fully-private operation.
+    options = _options_from_openai(body)
 
     if stream:
-        async def event_stream() -> AsyncIterator[bytes]:
+        async def ollama_event_stream() -> AsyncIterator[bytes]:
             try:
-                async for chunk in client.chat_stream(model=model, messages=messages, options=options):
+                async for chunk in chat.chat_stream(model=model, messages=messages, options=options):
                     openai_chunk = _ollama_chunk_to_openai(chunk, model, completion_id)
                     yield f"data: {json.dumps(openai_chunk)}\n\n".encode()
             except httpx.HTTPStatusError as e:
@@ -281,10 +351,10 @@ async def chat_completions(req: Request):
                 yield f"data: {json.dumps(err)}\n\n".encode()
             yield b"data: [DONE]\n\n"
 
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
+        return StreamingResponse(ollama_event_stream(), media_type="text/event-stream")
 
     try:
-        resp = await client.chat(model=model, messages=messages, options=options)
+        resp = await chat.chat(model=model, messages=messages, options=options)
     except httpx.HTTPStatusError as e:
         raise HTTPException(
             status_code=502,
@@ -314,7 +384,9 @@ async def status() -> JSONResponse:
     return JSONResponse(
         {
             "ok": True,
-            "ollama_url": s.ollama_base_url,
+            "chat_backend": s.mip_chat_backend,
+            "chat_base_url": s.mip_chat_base_url if s.mip_chat_backend == "openai_compat" else s.ollama_base_url,
+            "embed_url": s.ollama_base_url,
             "primary_model": s.mip_primary_model,
             "fallback_model": s.mip_fallback_model,
             "embed_model": s.mip_embed_model,
@@ -330,7 +402,7 @@ async def preview_rag(q: str) -> PlainTextResponse:
     """
     if not q.strip():
         raise HTTPException(status_code=400, detail="q must be non-empty")
-    chunks = await retrieve(_client(), settings().mip_default_collection, q.strip())
+    chunks = await retrieve(_embed_client(), settings().mip_default_collection, q.strip())
     if not chunks:
         return PlainTextResponse(f"(no chunks retrieved for query={q!r})")
     quota = intent_quota(q)
